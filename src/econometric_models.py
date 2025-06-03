@@ -48,6 +48,9 @@ def lasso_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
         + ["deal", "feat", "store_id", "brand_id", "sin_week", "cos_week"]
     )
 
+    if debug and debug_end is None:
+        debug_end = np.random.randint(60, len(subset))
+
     preds, actuals = [], []
     for end in range(60, len(subset)):
         train = subset.iloc[:end]
@@ -71,10 +74,24 @@ def lasso_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
     return rmse
 
 
-def gets_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
-    """
-    Rolling-window GETS (General-to-Specific) with OLS + t-ratio pruning.
-    Returns RMSE of one-step-ahead forecasts.
+def gets_per_series(
+    df: pd.DataFrame,
+    store: int,
+    brand: int,
+    *,
+    debug: bool = False,
+    debug_end: int | None = None,
+    return_residuals: bool = False,
+) -> float | tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    """Rolling-window GETS (General-to-Specific).
+
+    Parameters
+    ----------
+    debug:
+        If ``True`` print the first/last training rows and the test row for a
+        randomly chosen window.  ``debug_end`` can specify the window index.
+    return_residuals:
+        If ``True`` also return arrays of residuals, predictions and actuals.
     """
     subset = df[(df["store"] == store) & (df["brand"] == brand)].copy()
     subset = subset.sort_values("week")
@@ -128,8 +145,17 @@ def gets_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
         preds.append(pred)
         actuals.append(y_test.values[0])
 
+        if debug and end == debug_end:
+            print("Debug window index:", end)
+            print("Train first row:\n", train.iloc[0])
+            print("Train last row:\n", train.iloc[-1])
+            print("Test row:\n", test.iloc[0])
+
     mse = mean_squared_error(actuals, preds)
     rmse = np.sqrt(mse)
+    if return_residuals:
+        residuals = np.asarray(actuals) - np.asarray(preds)
+        return rmse, residuals, np.asarray(preds), np.asarray(actuals)
     return rmse
 
 

@@ -23,5 +23,3 @@ Run it with:
 ```bash
 python src/data_ingestion_preprocessing.py
 ```
-
-This will print basic dataset information and show a sample of the processed DataFrame.

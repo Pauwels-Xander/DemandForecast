@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 
-DATA_PATH = "OrangeJuiceX25.csv"
+DATA_PATH = "data\OrangeJuiceX25.csv"
 
 
 def load_data(path: str = DATA_PATH) -> pd.DataFrame:

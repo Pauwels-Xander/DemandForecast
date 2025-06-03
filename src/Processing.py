@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 
-DATA_PATH = "data/OrangeJuiceX25.csv"
+DATA_PATH = "OrangeJuiceX25.csv"
 
 
 def load_data(path: str = DATA_PATH) -> pd.DataFrame:
@@ -79,6 +79,7 @@ def main():
     df = load_data()
     explore_data(df)
     df_processed = preprocess_features(df)
+    df_processed.to_csv("processed_data.csv", index=False)
     print("\nProcessed Data Sample:\n", df_processed.head())
 
 

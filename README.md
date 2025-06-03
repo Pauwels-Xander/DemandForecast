@@ -58,5 +58,11 @@ Run it with:
 python src/xgboost_models.py
 ```
 
-This script requires the `xgboost` package in addition to `pandas` and
+For only the pooled approach, run:
+
+```bash
+python src/pooled_xgboost.py
+```
+
+These scripts require the `xgboost` package in addition to `pandas` and
 `scikit-learn`.

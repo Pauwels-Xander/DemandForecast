@@ -6,6 +6,7 @@
 | **Per‐series SARIMAX**           | 13 115.64 | Seasonal ARIMA with exogenous vars  |
 | **Per‐series LSTM**              | 13 296.37 | Simple RNN on [sales, price_mean]   |
 | **Per‐series Seq2Seq**           | 13 296.98 | RNN encoder+decoder with covariates |
+| **Transformer v2 (global)**      | 13 595.04 | Suspicious validate vs test tho     | 
 | **Transformer (global)**         | 17 965.90 | Single shared model for all series  |
 | **Pooled XGBoost**               | 21 430.91 | One tree‐ensemble for all series    |
 | **Pooled LASSO**                 | 21 856.82 | One linear model for all series     |

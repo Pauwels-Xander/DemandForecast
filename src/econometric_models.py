@@ -1,8 +1,3 @@
-# Econometric model prototypes: LASSO, GETS, and pooled LASSO
-# These are simple reference implementations using pandas, scikit-learn,
-# and statsmodels. They assume features have been preprocessed via
-# src/data_ingestion_preprocessing.py.
-
 from __future__ import annotations
 
 import pandas as pd
@@ -11,90 +6,116 @@ from sklearn.linear_model import LassoCV
 from sklearn.metrics import mean_squared_error
 import statsmodels.api as sm
 
-DATA_PATH = "data/OrangeJuiceX25.csv"
+DATA_PATH = "data\OrangeJuiceX25.csv"
 
-
-# ---------- Helpers ----------
 
 def load_processed() -> pd.DataFrame:
-    """Load and preprocess the dataset using existing utilities."""
-    from src.data_ingestion_preprocessing import load_data, preprocess_features
+    """Load raw data and apply preprocessing."""
+    from Processing import load_data, preprocess_features
 
-    df = load_data(DATA_PATH)
-    df = preprocess_features(df)
-    return df
+    df_raw = load_data(DATA_PATH)
+    print(f"After load_data: total rows = {len(df_raw)}")
 
+    df_processed = preprocess_features(df_raw)
+    print(f"After preprocess_features: total rows = {len(df_processed)}")
 
-# ---------- 3a. LASSO per store-brand ----------
+    return df_processed
+
 
 def lasso_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
-    """Run rolling-window LASSO for a single store-brand pair.
-
+    """
+    Rolling-window LASSO on one store–brand series.
     Returns RMSE of one-step-ahead forecasts.
     """
     subset = df[(df["store"] == store) & (df["brand"] == brand)].copy()
     subset = subset.sort_values("week")
 
-    # Target is next week's sales
     subset["y_next"] = subset["sales"].shift(-1)
-    subset.dropna(inplace=True)
+    subset.dropna(subset=["y_next"], inplace=True)
+    subset.dropna(subset=[f"sales_lag{l}" for l in (1, 2, 3)], inplace=True)
 
-    lag_cols = [f"sales_lag{lag}" for lag in [1, 2, 3]]
+    if len(subset) <= 60:
+        raise ValueError(
+            f"Not enough data for store={store}, brand={brand}: "
+            f"found {len(subset)} rows, need >60."
+        )
+
     price_cols = [c for c in subset.columns if c.startswith("price")]
-    week_dummies = pd.get_dummies(subset["week"] % 52, prefix="week")
-    subset = pd.concat([subset, week_dummies], axis=1)
-    feature_cols = lag_cols + price_cols + ["deal", "feat"] + list(week_dummies.columns)
+    lag_cols = [f"sales_lag{l}" for l in (1, 2, 3)]
+    feature_cols = (
+        price_cols
+        + lag_cols
+        + ["deal", "feat", "store_id", "brand_id", "sin_week", "cos_week"]
+    )
 
     preds, actuals = [], []
     for end in range(60, len(subset)):
         train = subset.iloc[:end]
         test = subset.iloc[end : end + 1]
 
-        X_train = train[feature_cols]
-        y_train = train["y_next"]
-        X_test = test[feature_cols]
-        y_test = test["y_next"]
+        X_train = train[feature_cols].astype(float)
+        y_train = train["y_next"].astype(float)
+        X_test = test[feature_cols].astype(float)
+        y_test = test["y_next"].astype(float)
 
-        model = LassoCV(cv=5, random_state=0).fit(X_train, y_train)
+        model = LassoCV(cv=5, random_state=0, max_iter=5000, tol=1e-5).fit(
+            X_train, y_train
+        )
         pred = model.predict(X_test)[0]
+
         preds.append(pred)
         actuals.append(y_test.values[0])
 
-    rmse = mean_squared_error(actuals, preds, squared=False)
+    mse = mean_squared_error(actuals, preds)
+    rmse = np.sqrt(mse)
     return rmse
 
 
-# ---------- 3b. GETS via OLS with t-ratio pruning ----------
-
 def gets_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
-    """Apply General-to-Specific regression with t-ratio pruning."""
+    """
+    Rolling-window GETS (General-to-Specific) with OLS + t-ratio pruning.
+    Returns RMSE of one-step-ahead forecasts.
+    """
     subset = df[(df["store"] == store) & (df["brand"] == brand)].copy()
     subset = subset.sort_values("week")
-    subset["y_next"] = subset["sales"].shift(-1)
-    subset.dropna(inplace=True)
 
-    lag_cols = [f"sales_lag{lag}" for lag in [1, 2, 3]]
+    subset["y_next"] = subset["sales"].shift(-1)
+    subset.dropna(subset=["y_next"], inplace=True)
+    subset.dropna(subset=[f"sales_lag{l}" for l in (1, 2, 3)], inplace=True)
+
+    if len(subset) <= 60:
+        raise ValueError(
+            f"Not enough data for GETS (store={store}, brand={brand}): "
+            f"found {len(subset)} rows, need >60."
+        )
+
     price_cols = [c for c in subset.columns if c.startswith("price")]
-    week_dummies = pd.get_dummies(subset["week"] % 52, prefix="week")
-    subset = pd.concat([subset, week_dummies], axis=1)
-    feature_cols = lag_cols + price_cols + ["deal", "feat"] + list(week_dummies.columns)
+    lag_cols = [f"sales_lag{l}" for l in (1, 2, 3)]
+    feature_cols = (
+        price_cols
+        + lag_cols
+        + ["deal", "feat", "store_id", "brand_id", "sin_week", "cos_week"]
+    )
 
     preds, actuals = [], []
     for end in range(60, len(subset)):
         train = subset.iloc[:end]
         test = subset.iloc[end : end + 1]
 
-        X = train[feature_cols]
-        y = train["y_next"]
-        X_test = test[feature_cols]
-        y_test = test["y_next"]
+        X = train[feature_cols].astype(float)
+        y = train["y_next"].astype(float)
+        X_test = test[feature_cols].astype(float)
+        y_test = test["y_next"].astype(float)
 
         X_const = sm.add_constant(X)
         model = sm.OLS(y, X_const).fit()
 
-        # Iteratively drop lowest |t| variable until all |t| >= 1.96
+        # Prune variables until all remaining |t| ≥ 1.96 or no variables left besides const
         while True:
-            tvals = model.tvalues.drop("const")
+            tvals = model.tvalues.drop(labels="const", errors="ignore").dropna()
+            if tvals.empty:
+                break
+
             min_var = tvals.abs().idxmin()
             if abs(tvals[min_var]) < 1.96:
                 X_const = X_const.drop(columns=[min_var])
@@ -103,66 +124,88 @@ def gets_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
             else:
                 break
 
-        pred = model.predict(sm.add_constant(X_test, has_constant="add"))[0]
+        pred = model.predict(sm.add_constant(X_test, has_constant="add")).iloc[0]
         preds.append(pred)
         actuals.append(y_test.values[0])
 
-    rmse = mean_squared_error(actuals, preds, squared=False)
+    mse = mean_squared_error(actuals, preds)
+    rmse = np.sqrt(mse)
     return rmse
 
 
-# ---------- 3c. Panel-wide LASSO ----------
-
 def pooled_lasso(df: pd.DataFrame) -> float:
-    """Pooled LASSO across all store-brand combinations."""
+    """
+    Pooled LASSO across all store-brand combinations.
+    Returns RMSE of one-step-ahead forecasts.
+    """
     df = df.sort_values(["store", "brand", "week"])
     df["y_next"] = df.groupby(["store", "brand"])["sales"].shift(-1)
-    df = df.dropna(subset=["y_next"])  # drop last week per series
+    df.dropna(subset=["y_next"], inplace=True)
+    df.dropna(subset=[f"sales_lag{l}" for l in (1, 2, 3)], inplace=True)
 
-    lag_cols = [f"sales_lag{lag}" for lag in [1, 2, 3]]
     price_cols = [c for c in df.columns if c.startswith("price")]
-    week_dummies = pd.get_dummies(df["week"] % 52, prefix="week")
-    df = pd.concat([df, week_dummies], axis=1)
+    lag_cols = [f"sales_lag{l}" for l in (1, 2, 3)]
     feature_cols = (
-        lag_cols
-        + price_cols
-        + ["deal", "feat", "store_id", "brand_id"]
-        + list(week_dummies.columns)
+        price_cols
+        + lag_cols
+        + ["deal", "feat", "store_id", "brand_id", "sin_week", "cos_week"]
     )
 
-    preds, actuals = [], []
+    df = df.dropna(subset=feature_cols)
+
     weeks = sorted(df["week"].unique())
-    for end in weeks[59:-1]:  # ensure at least 60 weeks in window
-        train = df[df["week"] <= end]
-        test = df[df["week"] == end + 1]
+    if len(weeks) <= 60:
+        raise ValueError(
+            f"Not enough distinct weeks in the pooled data (found {len(weeks)}, need >60)."
+        )
 
-        X_train = train[feature_cols]
-        y_train = train["y_next"]
-        X_test = test[feature_cols]
-        y_test = test["y_next"]
+    preds, actuals = [], []
+    for end_week in weeks[59:-1]:
+        train = df[df["week"] <= end_week].copy()
+        test = df[df["week"] == end_week + 1].copy()
 
-        model = LassoCV(cv=5, random_state=0).fit(X_train, y_train)
+        X_train = train[feature_cols].astype(float)
+        y_train = train["y_next"].astype(float)
+        X_test = test[feature_cols].astype(float)
+        y_test = test["y_next"].astype(float)
+
+        model = LassoCV(cv=5, random_state=0, max_iter=5000, tol=1e-5).fit(
+            X_train, y_train
+        )
         pred = model.predict(X_test)
+
         preds.extend(pred)
         actuals.extend(y_test)
 
-    rmse = mean_squared_error(actuals, preds, squared=False)
+    mse = mean_squared_error(actuals, preds)
+    rmse = np.sqrt(mse)
     return rmse
 
 
 if __name__ == "__main__":
     df_processed = load_processed()
-    # Example store-brand pair
-    sample_store, sample_brand = 1, 1
 
-    print("LASSO per series RMSE:")
-    rmse_lasso = lasso_per_series(df_processed, sample_store, sample_brand)
-    print(rmse_lasso)
+    sample_store, sample_brand = 21, 1
+    subset = df_processed[
+        (df_processed["store"] == sample_store)
+        & (df_processed["brand"] == sample_brand)
+    ]
+    print(f"Rows for store={sample_store}, brand={sample_brand}: {len(subset)}")
+
+    print("\nLASSO per series RMSE:")
+    try:
+        print(lasso_per_series(df_processed, sample_store, sample_brand))
+    except ValueError as e:
+        print("LASSO error:", e)
 
     print("\nGETS per series RMSE:")
-    rmse_gets = gets_per_series(df_processed, sample_store, sample_brand)
-    print(rmse_gets)
+    try:
+        print(gets_per_series(df_processed, sample_store, sample_brand))
+    except ValueError as e:
+        print("GETS error:", e)
 
     print("\nPooled LASSO RMSE:")
-    rmse_pooled = pooled_lasso(df_processed)
-    print(rmse_pooled)
+    try:
+        print(pooled_lasso(df_processed))
+    except ValueError as e:
+        print("Pooled LASSO error:", e)

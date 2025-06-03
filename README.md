@@ -82,3 +82,12 @@ python src/transformer_trt.py
 ```
 
 This script requires `pytorch` in addition to the packages above.
+
+## Sequence Models
+
+The script `src/sequence_models.py` implements a per-series LSTM and a simple Seq2Seq model.
+Run it with:
+```bash
+python src/sequence_models.py
+```
+This script also depends on `pytorch` and `scikit-learn`.

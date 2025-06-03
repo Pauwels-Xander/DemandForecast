@@ -9,7 +9,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from sklearn.metrics import mean_squared_error
 
-DATA_PATH = "data/OrangeJuiceX25.csv"
+DATA_PATH = "data\OrangeJuiceX25.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -18,7 +18,7 @@ DATA_PATH = "data/OrangeJuiceX25.csv"
 
 def load_processed() -> pd.DataFrame:
     """Load and preprocess the dataset using existing utilities."""
-    from src.data_ingestion_preprocessing import load_data, preprocess_features
+    from Processing import load_data, preprocess_features
 
     df = load_data(DATA_PATH)
     df = preprocess_features(df)
@@ -159,7 +159,8 @@ def lstm_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
         preds.append(pred)
         actuals.append(float(test["sales"].values[0]))
 
-    rmse = mean_squared_error(actuals, preds, squared=False)
+    mse = mean_squared_error(actuals, preds)
+    rmse = np.sqrt(mse)
     return rmse
 
 
@@ -206,7 +207,8 @@ def seq2seq_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
         preds.append(pred)
         actuals.append(float(test["sales"].values[0]))
 
-    rmse = mean_squared_error(actuals, preds, squared=False)
+    mse = mean_squared_error(actuals, preds)
+    rmse = np.sqrt(mse)
     return rmse
 
 
@@ -216,7 +218,7 @@ def seq2seq_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
 
 def main() -> None:
     df = load_processed()
-    store, brand = 1, 1
+    store, brand = 21, 1
     print("LSTM per-series RMSE:")
     rmse_lstm = lstm_per_series(df, store, brand)
     print(rmse_lstm)

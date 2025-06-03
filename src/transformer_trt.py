@@ -1,6 +1,15 @@
+"""Lightweight Transformer model for demand forecasting, now with test‐time RMSE.
+
+We:
+  1. Preprocess entire DataFrame as before (sales_lag, price, sin_week, cos_week, store_id, brand_id, etc.).
+  2. Choose a cutoff = (max_week − 10). All windows ending at t ≤ cutoff are used for training.
+  3. Build training dataset and train Transformer.
+  4. Build a separate “test” dataset of windows whose last index t is in (cutoff+1 … max_week−1).
+  5. Run model on test windows, collect (pred, actual), compute RMSE.
+"""
+
 from __future__ import annotations
 
-import math
 import warnings
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -10,36 +19,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+import xgboost as xgb  # (if you still need it elsewhere)
 from sklearn.metrics import mean_squared_error
-from torch.optim.lr_scheduler import CosineAnnealingLR
-
-warnings.filterwarnings("ignore", category=FutureWarning)
 
 DATA_PATH = "data\OrangeJuiceX25.csv"
 
-
-def load_processed() -> pd.DataFrame:
-    """
-    Load and preprocess the OrangeJuiceX25 data using the user’s existing pipeline.
-    This ensures price and lagged‐sales columns are already standardized.
-    """
-    from Processing import load_data, preprocess_features
-
-    df = load_data(DATA_PATH)
-    df = preprocess_features(df)
-
-    # Ensure store_id and brand_id codes exist (preprocess_features already does this).
-    if "store_id" not in df.columns:
-        df["store_id"] = df["store"].astype("category").cat.codes
-    if "brand_id" not in df.columns:
-        df["brand_id"] = df["brand"].astype("category").cat.codes
-
-    return df
-
+# ---------------------------------------------------------------------------
+# Data utilities (almost identical to before, but accepts an explicit cutoff)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SequenceSample:
-    past: np.ndarray       # shape (L, num_features); already scaled
+    past: np.ndarray       # shape (L, num_features)
     store_id: int          # 0-based
     brand_id: int          # 0-based
     target: float
@@ -49,11 +40,12 @@ class OJSequenceDataset(Dataset):
     """
     Sliding‐window dataset for training or testing.
 
-    - df must already have price_*, deal, feat, sin_week, cos_week, sales_lag1/2/3, store_id, brand_id.
-    - L is window length.
-    - cutoff_week determines which windows go into this split:
-         * If mode == "train", include only windows whose last index (t) <= cutoff_week.
-         * If mode == "test", include only windows whose last index (t) > cutoff_week.
+    - `df` must already have price_*, deal, feat, sin_week, cos_week, sales_lag1/2/3,
+      store_id, brand_id.
+    - `L` is window length.
+    - `cutoff_week` determines which windows go into this split:
+         * If mode=="train", we include only windows whose last index (t) ≤ cutoff_week.
+         * If mode=="test", we include only windows whose last index (t) > cutoff_week.
     """
 
     def __init__(
@@ -61,13 +53,13 @@ class OJSequenceDataset(Dataset):
         df: pd.DataFrame,
         L: int,
         cutoff_week: int,
-        mode: str = "train"
+        mode: str = "train"  # either "train" or "test"
     ):
         assert mode in ("train", "test")
         self.samples: List[SequenceSample] = []
         price_cols = [c for c in df.columns if c.startswith("price")]
-        lag_cols = [f"sales_lag{lag}" for lag in [1, 2, 3]]
-        feat_cols = price_cols + ["deal", "feat", "sin_week", "cos_week"] + lag_cols
+        lag_cols   = [f"sales_lag{lag}" for lag in [1, 2, 3]]
+        feat_cols  = price_cols + ["deal", "feat", "sin_week", "cos_week"] + lag_cols
 
         # Group by (store, brand), sort by week
         for (_, _), grp in df.groupby(["store", "brand"]):
@@ -76,6 +68,8 @@ class OJSequenceDataset(Dataset):
             bid = int(grp["brand_id"].iloc[0])
 
             # For each t in [L .. len(grp)-2], last index = t
+            # If mode=="train": only keep t ≤ cutoff_week
+            # If mode=="test": only keep t > cutoff_week
             for t in range(L, len(grp) - 1):
                 week_t = int(grp.iloc[t]["week"])
                 if mode == "train" and week_t > cutoff_week:
@@ -95,26 +89,28 @@ class OJSequenceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         sample = self.samples[idx]
-        past_tensor = torch.from_numpy(sample.past)                          # (L, num_features)
+        past_tensor = torch.from_numpy(sample.past)                          # float32 (L, num_features)
         store_tensor = torch.tensor(sample.store_id, dtype=torch.long)       # ( )
         brand_tensor = torch.tensor(sample.brand_id, dtype=torch.long)       # ( )
         target_tensor = torch.tensor(sample.target, dtype=torch.float32)     # ( )
         return past_tensor, store_tensor, brand_tensor, target_tensor
 
 
+# ---------------------------------------------------------------------------
+# Model definition (unchanged)
+# ---------------------------------------------------------------------------
+
 class SmallTransformer(nn.Module):
-    """Tiny Transformer encoder to predict next‐week sales, with learnable positional embeddings."""
+    """Tiny Transformer encoder to predict next‐week sales."""
 
     def __init__(
         self,
         num_features: int,
         num_stores: int,
         num_brands: int,
-        L: int,
-        d_model: int = 64,
-        nhead: int = 4,
-        num_layers: int = 3,
-        dropout: float = 0.1
+        d_model: int = 32,
+        nhead: int = 2,
+        num_layers: int = 2
     ):
         super().__init__()
         self.store_emb = nn.Embedding(num_stores, d_model)
@@ -124,81 +120,71 @@ class SmallTransformer(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dropout=dropout,
-            batch_first=True,
-            dim_feedforward=d_model * 4
+            dropout=0.1,
+            batch_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pos_emb = nn.Embedding(L, d_model)
-        self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(d_model, 1)
 
     def forward(
         self,
-        past: torch.Tensor,       # (batch, L, num_features)
-        store_id: torch.Tensor,   # (batch,)
-        brand_id: torch.Tensor    # (batch,)
+        past: torch.Tensor,     # (batch, L, num_features)
+        store_id: torch.Tensor,  # (batch,)
+        brand_id: torch.Tensor   # (batch,)
     ) -> torch.Tensor:
-        batch_size, seq_len, _ = past.size()
         x = self.input_proj(past)  # → (batch, L, d_model)
 
         store_vec = self.store_emb(store_id)  # (batch, d_model)
         brand_vec = self.brand_emb(brand_id)  # (batch, d_model)
-        context = (store_vec + brand_vec).unsqueeze(1)  # (batch, 1, d_model)
-        x = x + context
+        context = store_vec + brand_vec       # (batch, d_model)
+        context = context.unsqueeze(1)        # (batch, 1, d_model)
+        x = x + context                       # broadcast to (batch, L, d_model)
 
-        # Add learnable positional embeddings
-        positions = torch.arange(seq_len, device=past.device).unsqueeze(0).repeat(batch_size, 1)  # (batch, L)
-        x = x + self.pos_emb(positions)  # (batch, L, d_model)
+        # Simple sinusoidal positional encoding
+        seq_len = x.size(1)
+        pos = torch.arange(seq_len, device=x.device).float()       # (L,)
+        pe = torch.zeros(seq_len, x.size(2), device=x.device)      # (L, d_model)
+        pe[:, 0::2] = torch.sin(pos.unsqueeze(1) / 10.0)
+        pe[:, 1::2] = torch.cos(pos.unsqueeze(1) / 10.0)
+        x = x + pe.unsqueeze(0)  # (batch, L, d_model)
 
-        x = self.encoder(x)             # (batch, L, d_model)
-        x = x[:, -1, :]                 # (batch, d_model)
-        x = self.dropout(x)
-        return self.fc(x).squeeze(-1)   # (batch,)
+        out = self.encoder(x)    # (batch, L, d_model)
+        return self.fc(out[:, -1, :]).squeeze(-1)  # (batch,)
 
+
+# ---------------------------------------------------------------------------
+# Training + Testing routine
+# ---------------------------------------------------------------------------
 
 def train_and_evaluate_transformer(
     df: pd.DataFrame,
     L: int = 16,
     epochs: int = 20,
-    holdout_weeks: int = 10,
-    batch_size: int = 32
+    holdout_weeks: int = 10
 ) -> None:
     """
-    1) Split data into train windows (week <= max_week - holdout_weeks)
-       and test windows (week >  max_week - holdout_weeks).
-    2) Build and train on the train dataset.
-    3) After training, run on the test dataset and compute RMSE.
+    1) Split data into `train` windows (t ≤ max_week - holdout_weeks)
+       and `test` windows (t >  max_week - holdout_weeks).
+    2) Build and train on the “train” dataset.
+    3) After training, run on the “test” dataset and compute RMSE.
     """
 
     # 1a. Compute cutoff_week = max_week - holdout_weeks
     max_week = int(df["week"].max())
     cutoff_week = max_week - holdout_weeks
 
-    # 1b. Build train/test datasets (features already standardized upstream)
+    # 1b. Build train/test datasets
     train_dataset = OJSequenceDataset(df, L=L, cutoff_week=cutoff_week, mode="train")
     test_dataset  = OJSequenceDataset(df, L=L, cutoff_week=cutoff_week, mode="test")
 
     print(f"Number of training windows: {len(train_dataset)}")
     print(f"Number of  testing windows:  {len(test_dataset)}")
 
-    # 1c. DataLoaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True
-    )
-    test_loader  = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
+    test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False, num_workers=2)
 
     # 2. Instantiate model
+    # Infer num_features from one sample
     sample_past, _, _, _ = train_dataset[0]
     num_features = sample_past.shape[1]
     num_stores = int(df["store_id"].nunique())
@@ -208,64 +194,47 @@ def train_and_evaluate_transformer(
         num_features=num_features,
         num_stores=num_stores,
         num_brands=num_brands,
-        L=L,
-        d_model=64,
-        nhead=4,
-        num_layers=3,
-        dropout=0.1
+        d_model=32,
+        nhead=2,
+        num_layers=2
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # 3. Set up optimizer, scheduler, and mixed‐precision
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": [p for n, p in model.named_parameters() if "emb" not in n], "weight_decay": 1e-5},
-            {"params": [p for n, p in model.named_parameters() if "emb" in n], "weight_decay": 0.0},
-        ],
-        lr=1e-3
-    )
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    scaler_amp = torch.cuda.amp.GradScaler()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     criterion = nn.MSELoss()
 
-    # 3a. Training loop
+    # 2a. Train
+    model.train()
     for epoch in range(epochs):
-        model.train()
         running_loss = 0.0
-
         for past, store_id, brand_id, target in train_loader:
-            past, store_id, brand_id, target = [
-                t.to(device, non_blocking=True) for t in (past, store_id, brand_id, target)
-            ]
+            past = past.to(device)            # (batch, L, num_features)
+            store_id = store_id.to(device)    # (batch,)
+            brand_id = brand_id.to(device)    # (batch,)
+            target = target.to(device)        # (batch,)
+
             optimizer.zero_grad()
-
-            with torch.cuda.amp.autocast():
-                pred = model(past, store_id, brand_id)  # (batch,)
-                loss = criterion(pred, target)          # MSE
-
-            scaler_amp.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler_amp.step(optimizer)
-            scaler_amp.update()
-
+            pred = model(past, store_id, brand_id)  # (batch,)
+            loss = criterion(pred, target)
+            loss.backward()
+            optimizer.step()
             running_loss += loss.item() * past.size(0)
 
-        scheduler.step()
         epoch_loss = running_loss / len(train_dataset)
         print(f"Epoch {epoch+1}/{epochs}, train loss: {epoch_loss:.4f}")
 
     print("Training completed.\n")
 
-    # 4. Evaluate on test set
+    # 3. Evaluate on test set
     model.eval()
     all_preds = []
     all_targets = []
     with torch.no_grad():
         for past, store_id, brand_id, target in test_loader:
-            past, store_id, brand_id = [
-                t.to(device, non_blocking=True) for t in (past, store_id, brand_id)
-            ]
+            past = past.to(device)
+            store_id = store_id.to(device)
+            brand_id = brand_id.to(device)
             out = model(past, store_id, brand_id)  # (batch,)
             all_preds.append(out.cpu().numpy())
             all_targets.append(target.numpy())
@@ -277,10 +246,32 @@ def train_and_evaluate_transformer(
     print(f"Test RMSE (out‐of‐sample): {rmse_test:.2f}")
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def load_processed() -> pd.DataFrame:
+    """
+    Load and preprocess the OrangeJuiceX25 data. Ensure store_id/brand_id are present.
+    """
+    from Processing import load_data, preprocess_features
+
+    df = load_data(DATA_PATH)
+    df = preprocess_features(df)
+
+    # If preprocess_features didn’t add store_id/brand_id, add now:
+    if "store_id" not in df.columns:
+        df["store_id"] = df["store"].astype("category").cat.codes
+    if "brand_id" not in df.columns:
+        df["brand_id"] = df["brand"].astype("category").cat.codes
+
+    return df
+
+
 def main() -> None:
     df = load_processed()
-    # Hold out the last 10 weeks of each series for testing
-    train_and_evaluate_transformer(df, L=16, epochs=20, holdout_weeks=10, batch_size=32)
+    # Here we hold out the last 10 weeks of each series for testing:
+    train_and_evaluate_transformer(df, L=16, epochs=5, holdout_weeks=10)
 
 
 if __name__ == "__main__":

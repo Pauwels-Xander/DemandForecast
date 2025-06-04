@@ -1,0 +1,15 @@
+- Data analysis
+- Explore different transformations of regression & data
+- See which regressors important and adding stuff
+- Explore econometric modeling
+- Dimension Reduction Techniques (PCA, Factor Analysis)
+- ML models
+- Also pooled version to forecast new store
+
+
+Ask: Can we add data? Which year is or start date is the data from? Is it real data?
+Argue why ln St is best choice or perhaps other ideas for transformation of dependent variable.
+
+Which window size to use? --> 52
+Leaves 50 forecasts, pretty OK for statistical tests / hypothesis testing.
+

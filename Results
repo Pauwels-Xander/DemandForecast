@@ -2,16 +2,23 @@
 | -------------------------------- | --------- | ----------------------------------- |
 | **Per‐series GETS**              | 9 664.54  | Best per‐series linear model        |
 | **Per‐series LASSO**             | 9 923.32  | Nearly as good as GETS              |
-| **Per‐series XGBoost**           | 10 485.74 | Nonlinear per‐series boosting       |
+| **Per‐series XGBoost52**           | 8769.56 | Nonlinear per‐series boosting       |
 | **Per‐series SARIMAX**           | 13 115.64 | Seasonal ARIMA with exogenous vars  |
 | **Per‐series LSTM**              | 13 296.37 | Simple RNN on [sales, price_mean]   |
 | **Per‐series Seq2Seq**           | 13 296.98 | RNN encoder+decoder with covariates |
 | **Transformer v2 (global)**      | 13 595.04 | Suspicious validate vs test tho     | 
 | **Transformer (global)**         | 17 965.90 | Single shared model for all series  |
-| **Pooled XGBoost**               | 20 479.59 | One tree‐ensemble for all series    |
+| **Pooled XGBoost52**               | 19871.00 | One tree‐ensemble for all series    |
 | **Pooled LASSO**                 | 21 856.82 | One linear model for all series     |
 | **Persistence (naïve baseline)** | 27 882.50 | yₜ = yₜ₋₁                           |
 
 
+| Method | Average RMSE |
+| ------ | -----------: |
+| Ridge52  |   14423.0812 |
+| LASSO52  |   14436.5656 |
+| GETS52   |    9664.5374 |
+| SARIMAX52   |    22,925.34 |
 
-SARIMAX52: 22,925.34
+
+

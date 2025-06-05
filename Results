@@ -11,3 +11,7 @@
 | **Pooled XGBoost**               | 20 479.59 | One tree‐ensemble for all series    |
 | **Pooled LASSO**                 | 21 856.82 | One linear model for all series     |
 | **Persistence (naïve baseline)** | 27 882.50 | yₜ = yₜ₋₁                           |
+
+
+
+SARIMAX52: 22,925.34

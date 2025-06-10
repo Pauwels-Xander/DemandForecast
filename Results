@@ -21,7 +21,7 @@
 | SARIMAX52   |    22,925.34 | NEWL 18044.44
 | LSTM52   |    17 831.72 | NEW worse
 | SEQ2SEQ52   |    17 832.04 | NEW worse
-| XGBoost52   |    13038.16 |
-| TFT52   |    20884.48 |
+| XGBoost52   |    13038.16 | NEW 14060.53 worse
+| TFT52   |    20884.48 | NEW 20762.01
 
 

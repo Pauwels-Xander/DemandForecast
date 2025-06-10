@@ -19,8 +19,8 @@
 | LASSO52  |   14436.5656 |
 | GETS52   |    9664.5374 |
 | SARIMAX52   |    22,925.34 | NEWL 18044.44
-| LSTM52   |    17 831.72 |
-| SEQ2SEQ52   |    17 832.04 |
+| LSTM52   |    17 831.72 | NEW worse
+| SEQ2SEQ52   |    17 832.04 | NEW worse
 | XGBoost52   |    13038.16 |
 | TFT52   |    20884.48 |
 

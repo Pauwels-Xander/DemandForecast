@@ -1,14 +1,16 @@
-from __future__ import annotations
-
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LassoCV, RidgeCV, Lasso
+from sklearn.linear_model import LassoCV, RidgeCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
 import statsmodels.api as sm
-from tqdm import tqdm  # For progress bar
+from collections import Counter, defaultdict
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 DATA_PATH = "OrangeJuiceX25.csv"
-
+WINDOW_SIZE = 52  # number of weeks to train on each iteration
 
 def load_processed() -> pd.DataFrame:
     """Load raw data and apply preprocessing."""
@@ -22,227 +24,336 @@ def load_processed() -> pd.DataFrame:
 
     return df_processed
 
-
-def ridge_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
+def naive_rmse_series(df: pd.DataFrame, store: int, brand: int) -> float:
     """
-    Rolling-window RidgeCV on one store–brand series with a fixed window of 52 weeks.
-    Returns RMSE of one-step-ahead forecasts using Ridge with built-in CV.
+    Compute naïve persistence RMSE for a single store–brand series.
     """
-    subset = df[(df["store"] == store) & (df["brand"] == brand)].copy()
-    subset = subset.sort_values("week")
-
-    # Create next-week target, drop rows without lags/target
-    subset["y_next"] = subset["sales"].shift(-1)
-    subset.dropna(subset=["y_next"], inplace=True)
-    subset.dropna(subset=[f"sales_lag{l}" for l in (1, 2, 3)], inplace=True)
-
-    # Now we need at least 52 for the first training window + 1 for test → 53 rows total
-    if len(subset) < 53:
-        raise ValueError(
-            f"Not enough data for Ridge (store={store}, brand={brand}): "
-            f"found {len(subset)} rows, need ≥53."
-        )
-
-    price_cols = [c for c in subset.columns if c.startswith("price")]
-    lag_cols = [f"sales_lag{l}" for l in (1, 2, 3)]
-    feature_cols = (
-        price_cols
-        + lag_cols
-        + ["deal", "feat", "store_id", "brand_id", "sin_week", "cos_week"]
+    sub = (
+        df[(df["store"] == store) & (df["brand"] == brand)]
+        .sort_values("week")
+        .reset_index(drop=True)
     )
+    preds = sub["sales"].shift(1).dropna()
+    actuals = sub["sales"].iloc[1:].reset_index(drop=True)
+    return float(np.sqrt(mean_squared_error(actuals, preds)))
+
+def ridge_per_series(df: pd.DataFrame, store: int, brand: int) -> tuple[float, float, list, list]:
+    """
+    Rolling-window RidgeCV with standardized features.
+    Returns (RMSE, MAPE, feats, coef_list).
+    """
+    sub = (
+        df[(df["store"] == store) & (df["brand"] == brand)]
+        .sort_values("week")
+        .reset_index(drop=True)
+    )
+    sub["y_next"] = np.log(sub["sales"].shift(-1))
+    sub = sub.dropna().reset_index(drop=True)
+
+    if len(sub) < WINDOW_SIZE + 1:
+        raise ValueError(f"Not enough data for Ridge store={store},brand={brand}")
+
+    exclude = ["store", "brand", "week", "sales", "y_next"]
+    feats = [c for c in sub.columns if c not in exclude]
 
     preds, actuals = [], []
+    coef_list = []
+    tscv = TimeSeriesSplit(n_splits=5)
+    for end in range(WINDOW_SIZE, len(sub)):
+        train = sub.iloc[end - WINDOW_SIZE : end]
+        test = sub.iloc[end : end + 1]
 
-    # For each end index from 52 up to len(subset)-1, train on exactly 52 prior rows
-    for end in range(52, len(subset)):
-        train_window = subset.iloc[end - 52 : end]
-        test_row = subset.iloc[end : end + 1]
+        X_train = train[feats].astype(float)
+        y_train = train["y_next"].astype(float)
+        X_test = test[feats].astype(float)
+        y_true = test["sales"].iloc[0]
 
-        X_train = train_window[feature_cols].astype(float)
-        y_train = train_window["y_next"].astype(float)
-        X_test = test_row[feature_cols].astype(float)
-        y_test = test_row["y_next"].astype(float)
+        # 标准化 X_train 和 X_test
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
 
-        # RidgeCV over a small grid of alphas
-        ridge_alphas = np.logspace(-3, 3, 10)  # candidates between 1e-3 and 1e3
-        model_ridge = RidgeCV(
-            alphas=ridge_alphas, cv=5, scoring="neg_mean_squared_error"
-        ).fit(X_train, y_train)
-        pred = model_ridge.predict(X_test)[0]
+        model = RidgeCV(
+            alphas=np.logspace(-3, 3, 10),
+            cv=tscv,
+            scoring="neg_mean_squared_error",
+        ).fit(X_train_scaled, y_train)
 
-        preds.append(pred)
-        actuals.append(y_test.values[0])
+        coef_list.append(model.coef_)  # 记录标准化后的系数
 
-    mse = mean_squared_error(actuals, preds)
-    rmse = np.sqrt(mse)
-    return rmse
+        pred_train = model.predict(X_train_scaled)
+        resid = y_train - pred_train
+        smear = np.mean(np.exp(resid))
 
+        pred_log = model.predict(X_test_scaled)[0]
+        pred_sales = smear * np.exp(pred_log)
 
-def lasso_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
+        preds.append(pred_sales)
+        actuals.append(y_true)
+
+    rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
+    mape = float(np.mean(np.abs((np.array(actuals) - np.array(preds)) / np.array(actuals))))
+    return rmse, mape, feats, coef_list
+
+def lasso_per_series(df: pd.DataFrame, store: int, brand: int) -> tuple[float, float, list, list, list]:
     """
-    Rolling-window LASSO on one store–brand series with a fixed window of 52 weeks.
-    Returns RMSE of one-step-ahead forecasts.
+    Rolling-window LASSO with standardized features.
+    Returns (RMSE, MAPE, feats, selected_feats_list, coef_list).
     """
-    subset = df[(df["store"] == store) & (df["brand"] == brand)].copy()
-    subset = subset.sort_values("week")
-
-    subset["y_next"] = subset["sales"].shift(-1)
-    subset.dropna(subset=["y_next"], inplace=True)
-    subset.dropna(subset=[f"sales_lag{l}" for l in (1, 2, 3)], inplace=True)
-
-    # Now we need at least 52 for the first training window + 1 for test → 53 rows total
-    if len(subset) < 53:
-        raise ValueError(
-            f"Not enough data for LASSO (store={store}, brand={brand}): "
-            f"found {len(subset)} rows, need ≥53."
-        )
-
-    price_cols = [c for c in subset.columns if c.startswith("price")]
-    lag_cols = [f"sales_lag{l}" for l in (1, 2, 3)]
-    feature_cols = (
-        price_cols
-        + lag_cols
-        + ["deal", "feat", "store_id", "brand_id", "sin_week", "cos_week"]
+    sub = (
+        df[(df["store"] == store) & (df["brand"] == brand)]
+        .sort_values("week")
+        .reset_index(drop=True)
     )
+    sub["y_next"] = np.log(sub["sales"].shift(-1))
+    sub = sub.dropna().reset_index(drop=True)
+
+    if len(sub) < WINDOW_SIZE + 1:
+        raise ValueError(f"Not enough data for LASSO store={store},brand={brand}")
+
+    exclude = ["store", "brand", "week", "sales", "y_next"]
+    feats = [c for c in sub.columns if c not in exclude]
 
     preds, actuals = [], []
+    selected_feats_list = []
+    coef_list = []
+    tscv = TimeSeriesSplit(n_splits=5)
+    for end in range(WINDOW_SIZE, len(sub)):
+        train = sub.iloc[end - WINDOW_SIZE : end]
+        test = sub.iloc[end : end + 1]
 
-    for end in range(52, len(subset)):
-        train_window = subset.iloc[end - 52 : end]
-        test_row = subset.iloc[end : end + 1]
+        X_train = train[feats].astype(float)
+        y_train = train["y_next"].astype(float)
+        X_test = test[feats].astype(float)
+        y_true = test["sales"].iloc[0]
 
-        X_train = train_window[feature_cols].astype(float)
-        y_train = train_window["y_next"].astype(float)
-        X_test = test_row[feature_cols].astype(float)
-        y_test = test_row["y_next"].astype(float)
+        # 标准化 X_train 和 X_test
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
 
-        model = LassoCV(
-            cv=5,
-            random_state=0,
-            max_iter=5000,
-            tol=1e-5,
-        ).fit(X_train, y_train)
-        pred = model.predict(X_test)[0]
+        model = LassoCV(cv=tscv, random_state=0, max_iter=10000, tol=1e-5).fit(X_train_scaled, y_train)
+        
+        selected_feats = [feats[i] for i in range(len(feats)) if model.coef_[i] != 0]
+        selected_feats_list.append(selected_feats)
+        coef_list.append(model.coef_)
 
-        preds.append(pred)
-        actuals.append(y_test.values[0])
+        pred_train = model.predict(X_train_scaled)
+        resid = y_train - pred_train
+        smear = np.mean(np.exp(resid))
 
-    mse = mean_squared_error(actuals, preds)
-    rmse = np.sqrt(mse)
-    # If you ever want to inspect which alpha LassoCV picked, uncomment:
-    # print(f"Store={store}, Brand={brand}, chosen LASSO alpha = {model.alpha_:.4f}")
-    return rmse
+        pred_log = model.predict(X_test_scaled)[0]
+        pred_sales = smear * np.exp(pred_log)
 
+        preds.append(pred_sales)
+        actuals.append(y_true)
 
-def gets_per_series(df: pd.DataFrame, store: int, brand: int) -> float:
+    rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
+    mape = float(np.mean(np.abs((np.array(actuals) - np.array(preds)) / np.array(actuals))))
+    return rmse, mape, feats, selected_feats_list, coef_list
+
+def gets_per_series(df: pd.DataFrame, store: int, brand: int) -> tuple[float, float, list, list]:
     """
-    Rolling-window GETS (General-to-Specific) with OLS + t-ratio pruning,
-    using a fixed window of 52 weeks.
-    Returns RMSE of one-step-ahead forecasts.
+    Rolling-window GETS (OLS + t-pruning) with standardized features.
+    Returns (RMSE, MAPE, feats, signif_feats_list), with corrected Duan smearing.
     """
-    subset = df[(df["store"] == store) & (df["brand"] == brand)].copy()
-    subset = subset.sort_values("week")
-
-    subset["y_next"] = subset["sales"].shift(-1)
-    subset.dropna(subset=["y_next"], inplace=True)
-    subset.dropna(subset=[f"sales_lag{l}" for l in (1, 2, 3)], inplace=True)
-
-    # Now we need at least 52 for the first training window + 1 for test → 53 rows total
-    if len(subset) < 53:
-        raise ValueError(
-            f"Not enough data for GETS (store={store}, brand={brand}): "
-            f"found {len(subset)} rows, need ≥53."
-        )
-
-    price_cols = [c for c in subset.columns if c.startswith("price")]
-    lag_cols = [f"sales_lag{l}" for l in (1, 2, 3)]
-    feature_cols = (
-        price_cols
-        + lag_cols
-        + ["deal", "feat", "store_id", "brand_id", "sin_week", "cos_week"]
+    sub = (
+        df[(df["store"] == store) & (df["brand"] == brand)]
+        .sort_values("week")
+        .reset_index(drop=True)
     )
+    sub["y_next"] = np.log(sub["sales"].shift(-1))
+    sub = sub.dropna().reset_index(drop=True)
+
+    if len(sub) < WINDOW_SIZE + 1:
+        raise ValueError(f"Not enough data for GETS store={store},brand={brand}")
+
+    exclude = ["store", "brand", "week", "sales", "y_next"]
+    feats = [c for c in sub.columns if c not in exclude]
 
     preds, actuals = [], []
+    signif_feats_list = []
+    for end in range(WINDOW_SIZE, len(sub)):
+        train = sub.iloc[end - WINDOW_SIZE : end]
+        test = sub.iloc[end : end + 1]
 
-    for end in range(52, len(subset)):
-        train_window = subset.iloc[end - 52 : end]
-        test_row = subset.iloc[end : end + 1]
+        X = train[feats].astype(float)
+        y = train["y_next"].astype(float)
+        X_test = test[feats].astype(float)
+        y_true = test["sales"].iloc[0]
 
-        X = train_window[feature_cols].astype(float)
-        y = train_window["y_next"].astype(float)
-        X_test = test_row[feature_cols].astype(float)
-        y_test = test_row["y_next"].astype(float)
+        # 标准化 X 和 X_test
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        X_test_scaled = scaler.transform(X_test)
 
-        X_const = sm.add_constant(X)
+        # 将标准化后的数据转换为 DataFrame，保留列名
+        X_scaled = pd.DataFrame(X_scaled, columns=feats, index=X.index)
+        X_test_scaled = pd.DataFrame(X_test_scaled, columns=feats, index=X_test.index)
+
+        X_const = sm.add_constant(X_scaled)
         model = sm.OLS(y, X_const).fit()
 
-        # Prune variables until all remaining |t| ≥ 1.96 or no variables left besides const
+        # t 检验剪枝
         while True:
-            tvals = model.tvalues.drop(labels="const", errors="ignore").dropna()
-            if tvals.empty:
+            # get t-values without the constant
+            tvals = model.tvalues.drop(labels="const", errors="ignore")
+            # drop any NaNs so we never pick 'nan' as the worst
+            tvals = tvals.dropna()
+            # if there are no more features, or all remaining are significant, stop
+            if tvals.empty or (tvals.abs() >= 1.96).all():
                 break
 
-            min_var = tvals.abs().idxmin()
-            if abs(tvals[min_var]) < 1.96:
-                X_const = X_const.drop(columns=[min_var])
-                X_test = X_test.drop(columns=[min_var])
-                model = sm.OLS(y, X_const).fit()
-            else:
-                break
+            # pick the feature with the smallest |t-value|
+            worst = tvals.abs().idxmin()
 
-        pred = model.predict(sm.add_constant(X_test, has_constant="add")).iloc[0]
-        preds.append(pred)
-        actuals.append(y_test.values[0])
+            # prune it out
+            X_const = X_const.drop(columns=[worst])
+            X_test_scaled = X_test_scaled.drop(columns=[worst])
 
-    mse = mean_squared_error(actuals, preds)
-    rmse = np.sqrt(mse)
-    return rmse
+            # re-fit on the reduced set
+            model = sm.OLS(y, X_const).fit()
 
+        # 记录显著特征
+        signif_feats = [feat for feat, tval in zip(X_const.columns[1:], model.tvalues[1:]) if abs(tval) >= 1.96]
+        signif_feats_list.append(signif_feats)
+
+        fitted = model.predict(X_const)
+        resid = y - fitted
+        smear = np.mean(np.exp(resid))
+
+        pred_log = model.predict(sm.add_constant(X_test_scaled, has_constant="add")).iloc[0]
+        pred_sales = smear * np.exp(pred_log)
+
+        preds.append(pred_sales)
+        actuals.append(y_true)
+
+    rmse = float(np.sqrt(mean_squared_error(actuals, preds)))
+    mape = float(np.mean(np.abs((np.array(actuals) - np.array(preds)) / np.array(actuals))))
+    return rmse, mape, feats, signif_feats_list
 
 if __name__ == "__main__":
-    # Load processed data
-    df_processed = load_processed()
+    df = load_processed()
+    combos = df[["store", "brand"]].drop_duplicates().values
+    print(f"Found {len(combos)} store–brand combinations.\n")
 
-    # Find all unique (store, brand) pairs
-    combos = df_processed[["store", "brand"]].drop_duplicates().values
-    total_combos = len(combos)
-    print(f"Found {total_combos} unique store–brand combinations.\n")
+    results = []
+    lasso_selected_counts = Counter()
+    lasso_coef_values = defaultdict(list)
+    gets_signif_counts = Counter()
+    ridge_coef_values = defaultdict(list)
 
-    ridge_rmses = []
-    lasso_rmses = []
-    gets_rmses = []
-
-    # Loop over each store–brand pair
-    for store, brand in tqdm(combos, desc="Processing store-brand combos"):
-        # 1) Compute RidgeCV RMSE (rolling window of 52)
+    for store, brand in tqdm(combos, desc="Processing combos"):
         try:
-            rmse_r = ridge_per_series(df_processed, store, brand)
-            ridge_rmses.append(rmse_r)
+            naive = naive_rmse_series(df, store, brand)
+
+            r_rmse, r_mape, feats_r, coef_list_r = ridge_per_series(df, store, brand)
+            for coef in coef_list_r:
+                for feat, val in zip(feats_r, coef):
+                    ridge_coef_values[feat].append(val)
+
+            l_rmse, l_mape, feats_l, selected_feats_list_l, coef_list_l = lasso_per_series(df, store, brand)
+            for selected_feats in selected_feats_list_l:
+                for feat in selected_feats:
+                    lasso_selected_counts[feat] += 1
+            for coef in coef_list_l:
+                for feat, val in zip(feats_l, coef):
+                    if val != 0:
+                        lasso_coef_values[feat].append(val)
+
+            g_rmse, g_mape, feats_g, signif_feats_list_g = gets_per_series(df, store, brand)
+            for signif_feats in signif_feats_list_g:
+                for feat in signif_feats:
+                    gets_signif_counts[feat] += 1
+
+            results.append({
+                "store": store,
+                "brand": brand,
+                "naive_rmse": naive,
+                "ridge_rmse": r_rmse, "ridge_rel": r_rmse / naive, "ridge_mape": r_mape,
+                "lasso_rmse": l_rmse, "lasso_rel": l_rmse / naive, "lasso_mape": l_mape,
+                "gets_rmse":  g_rmse, "gets_rel":  g_rmse / naive, "gets_mape":  g_mape,
+            })
         except ValueError:
-            # Not enough data → skip
-            pass
+            continue
 
-        # 2) Compute LASSO RMSE (rolling window of 52)
-        try:
-            rmse_l = lasso_per_series(df_processed, store, brand)
-            lasso_rmses.append(rmse_l)
-        except ValueError:
-            # Not enough data → skip
-            pass
+    res_df = pd.DataFrame(results)
+    print("\nAverage metrics across all combos:")
+    print(res_df[[
+        "ridge_rmse", "ridge_rel", "ridge_mape",
+        "lasso_rmse", "lasso_rel", "lasso_mape",
+        "gets_rmse", "gets_rel", "gets_mape"
+    ]].mean().to_frame("mean_value"))
 
-        # 3) Compute GETS RMSE (rolling window of 52)
-        try:
-            rmse_g = gets_per_series(df_processed, store, brand)
-            gets_rmses.append(rmse_g)
-        except ValueError:
-            # Not enough data → skip
-            pass
+    # Aggregate total runs for normalization
+    total_runs = sum(len(df[(df["store"] == store) & (df["brand"] == brand)]) - WINDOW_SIZE
+                    for store, brand in combos if len(df[(df["store"] == store) & (df["brand"] == brand)]) > WINDOW_SIZE)
 
-    # Compute average RMSE for each method (if any combos succeeded)
-    avg_ridge = np.mean(ridge_rmses) if ridge_rmses else float("nan")
-    avg_lasso = np.mean(lasso_rmses) if lasso_rmses else float("nan")
-    avg_gets = np.mean(gets_rmses) if gets_rmses else float("nan")
+    # LASSO Summary
+    print("\n### LASSO Feature Selection Summary")
+    lasso_summary = []
+    for feat in feats_l:
+        sel_rate = lasso_selected_counts[feat] / total_runs if total_runs > 0 else 0
+        mean_coef = np.mean(lasso_coef_values[feat]) if lasso_coef_values[feat] else 0
+        std_coef = np.std(lasso_coef_values[feat]) if lasso_coef_values[feat] else 0
+        lasso_summary.append({
+            "Feature": feat,
+            "Selection Rate": sel_rate,
+            "Mean Coef": mean_coef,
+            "Std Coef": std_coef
+        })
+        print(f"{feat}: Selection Rate={sel_rate:.2%}, Mean Coef={mean_coef:.3f}, Std Coef={std_coef:.3f}")
+    lasso_summary_df = pd.DataFrame(lasso_summary)
 
-    print(f"\nAverage RMSE across all store–brand combos (Ridge) : {avg_ridge:.4f}")
-    print(f"Average RMSE across all store–brand combos (LASSO): {avg_lasso:.4f}")
-    print(f"Average RMSE across all store–brand combos (GETS) : {avg_gets:.4f}")
+    # GETS Summary
+    print("\n### GETS Feature Significance Summary")
+    gets_summary = []
+    for feat in feats_g:
+        sig_rate = gets_signif_counts[feat] / total_runs if total_runs > 0 else 0
+        gets_summary.append({"Feature": feat, "Significance Rate": sig_rate})
+        print(f"{feat}: Significance Rate={sig_rate:.2%}")
+    gets_summary_df = pd.DataFrame(gets_summary)
+
+    # Ridge Summary
+    print("\n### Ridge Coefficient Summary")
+    ridge_summary = []
+    for feat in feats_r:
+        mean_coef = np.mean(ridge_coef_values[feat])
+        std_coef = np.std(ridge_coef_values[feat])
+        ridge_summary.append({"Feature": feat, "Mean Coef": mean_coef, "Std Coef": std_coef})
+        print(f"{feat}: Mean Coef={mean_coef:.3f}, Std Coef={std_coef:.3f}")
+    ridge_summary_df = pd.DataFrame(ridge_summary)
+
+    # Visualizations
+    plt.figure(figsize=(12, 6))
+    plt.bar(lasso_summary_df["Feature"], lasso_summary_df["Selection Rate"])
+    plt.xticks(rotation=45)
+    plt.title("LASSO Feature Selection Rate")
+    plt.xlabel("Features")
+    plt.ylabel("Selection Rate")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(12, 6))
+    plt.bar(gets_summary_df["Feature"], gets_summary_df["Significance Rate"])
+    plt.xticks(rotation=45)
+    plt.title("GETS Feature Significance Rate")
+    plt.xlabel("Features")
+    plt.ylabel("Significance Rate")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(12, 6))
+    ridge_data = [ridge_coef_values[feat] for feat in feats_r]
+    plt.boxplot(ridge_data, labels=feats_r)
+    plt.xticks(rotation=45)
+    plt.title("Ridge Coefficient Distributions")
+    plt.xlabel("Features")
+    plt.ylabel("Coefficient Value")
+    plt.tight_layout()
+    plt.show()
+
+    # Summary Table of Top Features
+    top_lasso = lasso_summary_df.sort_values("Selection Rate", ascending=False).head(5)
+    print("\n### Top 5 LASSO Features")
+    print(top_lasso.to_string(index=False))

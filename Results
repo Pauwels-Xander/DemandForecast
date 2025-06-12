@@ -15,10 +15,10 @@
 
 | Method | Average RMSE |
 | ------ | -----------: |
-| Ridge52  |   14423.0812 |
-| LASSO52  |   14436.5656 |
-| GETS52   |    9664.5374 |
-| SARIMAX52   |    22,925.34 | NEWL 18044.44
+| Ridge52  |   14423.0812 | NEW 13440.08
+| LASSO52  |   14436.5656 | NEW 13186.02
+| GETS52   |    9664.5374 | NEW 674764.04 (worse)
+| SARIMAX52   |    22,925.34 | NEW 18044.44
 | LSTM52   |    17 831.72 | NEW worse
 | SEQ2SEQ52   |    17 832.04 | NEW worse
 | XGBoost52   |    13038.16 | NEW 14060.53 worse

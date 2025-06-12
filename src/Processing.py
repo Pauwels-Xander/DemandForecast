@@ -1,86 +1,150 @@
-"""Data Ingestion, Exploration, and Preprocessing for OrangeJuiceX25 dataset."""
+"""Data Ingestion and Preprocessing for OrangeJuiceX25 dataset."""
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 
-DATA_PATH = "data\OrangeJuiceX25.csv"
+DATA_PATH = "OrangeJuiceX25.csv"
 
 
 def load_data(path: str = DATA_PATH) -> pd.DataFrame:
-    """Load dataset into a pandas DataFrame."""
     df = pd.read_csv(path)
+    print(
+        "▶ Loaded file:", path,
+        "| rows:", df.shape[0],
+        "| unique stores:", df["store"].nunique(),
+        "| unique brands:", df["brand"].nunique(),
+        "| unique weeks:", df["week"].nunique()
+    )
     return df
-
-
-def explore_data(df: pd.DataFrame) -> None:
-    """Print basic info and create exploration plots."""
-    print("Shape:", df.shape)
-    print("\nData types:\n", df.dtypes)
-
-    price_cols = [c for c in df.columns if c.startswith("price")]
-    summary = df[price_cols + ["deal", "feat", "sales"]].describe()
-    print("\nSummary statistics:\n", summary)
-
-    # Distribution of sales
-    plt.figure(figsize=(6, 4))
-    sns.histplot(df["sales"], bins=50)
-    plt.title("Distribution of Weekly Sales")
-    plt.xlabel("sales")
-    plt.tight_layout()
-    plt.show()
-
-    # Correlation matrix of price columns
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(df[price_cols].corr(), cmap="coolwarm", annot=True, fmt=".2f")
-    plt.title("Correlation Matrix of Price Series")
-    plt.tight_layout()
-    plt.show()
 
 
 def preprocess_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean and engineer features."""
-    price_cols = [c for c in df.columns if c.startswith("price")]
+    """
+    Engineer the 17 regressors as per Proposal (no Box–Cox, no HolidayDummy):
+      1. OwnLogPrice
+      2. LaggedLogPrice_1, _2
+      3. MinCompPrice, LogMinCompPrice
+      4. FeatFlag, FeatFlag_L1
+      5. DealFlag, DealFlag_L1
+      6. CategoryFeatCount, CategoryFeatShare
+      7. CategoryDealCount, CategoryDealShare
+      8. PromoInteraction
+      9. CrossFeatPressure
+     10. LagLogSales
+     11. MarketShareLog
+     12. Price_x_Feat, Price_x_Deal
+     13. Holidays
+    """
+    # 0. 复制并重置索引
+    df = df.copy().reset_index(drop=True)
 
-    # Replace zero or negative prices with NaN and forward fill
-    df[price_cols] = df[price_cols].mask(df[price_cols] <= 0)
-    df[price_cols] = df.groupby(["store", "brand"])[price_cols].fillna(method="ffill")
+    # 1. 确定所有价格列（price1…price11），并按 store 前向填充
+    price_cols = sorted(
+        [c for c in df.columns if c.startswith("price")],
+        key=lambda x: int(x.replace("price", "")),
+    )
+    df[price_cols] = (
+        df.groupby("store")[price_cols]
+          .transform(lambda g: g.fillna(method="ffill"))
+    )
 
-    # Flag where price was originally zero or NaN
-    for col in price_cols:
-        df[f"{col}_was_zero"] = df[col].isna().astype(int)
+    # 2. 特征标记
+    df["FeatFlag"] = df["feat"].astype(int)
+    df["DealFlag"] = df["deal"].astype(int)
 
-    # Create lagged sales features per store-brand
-    df = df.sort_values(["store", "brand", "week"])  # ensure chronological order
-    for lag in [1, 2, 3]:
-        df[f"sales_lag{lag}"] = df.groupby(["store", "brand"])["sales"].shift(lag)
+    # 3. 计算 OwnLogPrice 和滞后两期
+    prices_arr = df[price_cols].to_numpy()
+    brand_idxs = df["brand"].astype(int).to_numpy() - 1  # brand 1→price1索引0
+    own_prices = prices_arr[np.arange(len(df)), brand_idxs]
+    df["OwnLogPrice"]    = np.log(own_prices + 1e-6)
+    df["LagLogPrice_1"]  = df.groupby(["store", "brand"])["OwnLogPrice"].shift(1)
+    df["LagLogPrice_2"]  = df.groupby(["store", "brand"])["OwnLogPrice"].shift(2)
 
-    # Encode store_id and brand_id as categorical codes
-    df["store_id"] = df["store"].astype("category").cat.codes
-    df["brand_id"] = df["brand"].astype("category").cat.codes
+    # 4. 计算 MinCompPrice & LogMinCompPrice
+    comp_arr = prices_arr.copy()
+    comp_arr[np.arange(len(df)), brand_idxs] = np.nan
+    min_comp = np.nanmin(comp_arr, axis=1)
+    df["MinCompPrice"]     = min_comp
+    df["LogMinCompPrice"]  = np.log(min_comp + 1e-6)
 
-    # Cyclical seasonal indicators (week-of-year modulo 52)
-    df["week_mod"] = df["week"] % 52
-    df["sin_week"] = np.sin(2 * np.pi * df["week_mod"] / 52)
-    df["cos_week"] = np.cos(2 * np.pi * df["week_mod"] / 52)
-    df.drop(columns="week_mod", inplace=True)
+    # 5. 滞后 feat/deal 标志
+    df["FeatFlag_L1"] = df.groupby(["store", "brand"])["FeatFlag"].shift(1)
+    df["DealFlag_L1"] = df.groupby(["store", "brand"])["DealFlag"].shift(1)
 
-    # Standardize price and lagged sales features
+    # 6. 类别级 feat/deal 计数与份额
+    grp = df.groupby(["store", "week"])
+    df["CategoryFeatCount"] = grp["FeatFlag"].transform("sum")
+    df["CategoryFeatShare"] = df["CategoryFeatCount"] / 11
+    df["CategoryDealCount"] = grp["DealFlag"].transform("sum")
+    df["CategoryDealShare"] = df["CategoryDealCount"] / 11
+
+    # 7. 促销交互 & 同品类竞争强度
+    df["PromoInteraction"]  = df["FeatFlag"] * df["DealFlag"]
+    df["OthersFeatSum"]     = grp["FeatFlag"].transform("sum") - df["FeatFlag"]
+    df["CrossFeatPressure"] = df["FeatFlag"] * (df["OthersFeatSum"] > 0).astype(int)
+
+    # 8. 滞后对数销量
+    df["LagLogSales"] = (
+        df.groupby(["store", "brand"])["sales"]
+          .shift(1)
+          .pipe(lambda s: np.log(s + 1e-6))
+    )
+
+    # 9. MarketShareLog
+    df["LogSales"]      = np.log(df["sales"] + 1e-6)
+    total_sales_store  = grp["sales"].transform("sum")
+    df["MarketShareLog"] = df["LogSales"] - np.log(total_sales_store + 1e-6)
+
+    # 10. Price × Feat, Price × Deal
+    df["Price_x_Feat"] = df["OwnLogPrice"] * df["FeatFlag"]
+    df["Price_x_Deal"] = df["OwnLogPrice"] * df["DealFlag"]
+
+    # 11. Holidays
+    df["Holiday"] = [0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0] * 110
+
+
+    # —— 到此共 17 个 regressor ——
+    regressors = [
+        "OwnLogPrice", "LagLogPrice_1", "LagLogPrice_2",
+        "MinCompPrice", "LogMinCompPrice",
+        "FeatFlag", "FeatFlag_L1",
+        "DealFlag", "DealFlag_L1",
+        "CategoryFeatCount", "CategoryFeatShare",
+        "CategoryDealCount", "CategoryDealShare",
+        "PromoInteraction", "CrossFeatPressure",
+        "LagLogSales", "MarketShareLog",
+        "Price_x_Feat", "Price_x_Deal", "Holiday"
+    ]
+
+    # 11. 按 store–brand–week 排序并重置索引
+    df = df.sort_values(["store", "brand", "week"])\
+           .reset_index(drop=True)
+
+    # 12. 标准化这 17 个特征
     scaler = StandardScaler()
-    cont_cols = price_cols + [f"sales_lag{lag}" for lag in [1, 2, 3]]
-    df[cont_cols] = scaler.fit_transform(df[cont_cols])
+    df[regressors] = scaler.fit_transform(df[regressors].values)
 
-    return df
+    # 13. 最终只保留 identifiers + sales + regressors
+    keep_cols = ["store", "brand", "week", "sales"] + regressors
+    df_final = df[keep_cols].copy()
+
+    return df_final
 
 
 def main():
     df = load_data()
-    explore_data(df)
-    df_processed = preprocess_features(df)
-    df_processed.to_csv("processed_data.csv", index=False)
-    print("\nProcessed Data Sample:\n", df_processed.head())
+    processed = preprocess_features(df)
+    processed.to_csv("processed_dataBobo.csv", index=False)
+    print("Processed Data Sample:\n", processed.head())
+
+def load_data(path: str = DATA_PATH) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    print(f">>> Loaded `{path}`:",
+          f"stores={df['store'].nunique()}",
+          f"brands={df['brand'].nunique()}",
+          f"weeks={df['week'].nunique()}")
+    return df
 
 
 if __name__ == "__main__":

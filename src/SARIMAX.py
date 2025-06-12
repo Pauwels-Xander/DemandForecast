@@ -30,12 +30,12 @@ def load_processed() -> pd.DataFrame:
 
 
 def sarimax_per_series(
-    subset: pd.DataFrame,
-    order: tuple[int, int, int] = (1, 0, 0),
-    seasonal_order: tuple[int, int, int, int] = (0, 0, 0, 0),
+        subset: pd.DataFrame,
+        order: tuple[int, int, int] = (1, 0, 0),
+        seasonal_order: tuple[int, int, int, int] = (0, 0, 0, 0),
 ) -> float:
     """
-    Rolling‐window SARIMAX for one store–brand pair, using a 52‐week DateTime index
+    Rolling-window SARIMAX for one store-brand pair, using a 52-week DateTime index
     and convergence/frequency fixes.
 
     Parameters
@@ -44,7 +44,7 @@ def sarimax_per_series(
         Preprocessed data for a single (store, brand) pair, containing at least:
         - "week": a date string or period that can be converted to datetime
         - "sales": the target time series
-        - exogenous columns: any column starting with "price", plus "deal", "feat"
+        - exogenous columns: recommended subset of predictors
     order : tuple
         ARIMA(p, d, q) order.
     seasonal_order : tuple
@@ -53,7 +53,7 @@ def sarimax_per_series(
     Returns
     -------
     float
-        RMSE across all one‐step forecasts produced by sliding a 52‐week window.
+        RMSE across all one-step forecasts produced by sliding a 52-week window.
     """
     # 1) Sort by "week", convert to datetime, set as index
     subset = subset.sort_values("week").reset_index(drop=True)
@@ -63,17 +63,26 @@ def sarimax_per_series(
     # 2) Infer and set a weekly frequency on the index to avoid ValueWarning
     inferred_freq = pd.infer_freq(subset.index)
     if inferred_freq is None:
-        # If inference fails, explicitly set to weekly freq
         subset.index = pd.DatetimeIndex(subset.index.values, freq="W")
     else:
         subset.index = pd.DatetimeIndex(subset.index.values, freq=inferred_freq)
 
-    # 3) Create one‐step‐ahead target column and drop the last row
+    # 3) Create one-step-ahead target column and drop the last row
     subset["y_next"] = subset["sales"].shift(-1)
     subset.dropna(inplace=True)
 
-    # 4) Identify exogenous columns (drop "week" since it's now the index)
-    exog_cols = [c for c in subset.columns if c.startswith("price")] + ["deal", "feat"]
+    # 4) Define recommended exogenous columns
+    recommended_exog_cols = [
+        "OwnLogPrice", "FeatFlag", "DealFlag", "Holiday", "PromoInteraction"
+    ]
+    # Only include columns that exist in the dataset
+    exog_cols = [c for c in recommended_exog_cols if c in subset.columns]
+
+    # If no recommended columns are found, fall back to all non-excluded columns
+    if not exog_cols:
+        exog_cols = [c for c in subset.columns if c not in ["sales", "y_next", "store", "brand"]]
+        print(f"Warning: None of recommended exogenous columns found for store {subset['store'].iloc[0]}, "
+              f"brand {subset['brand'].iloc[0]}. Using all available: {exog_cols}")
 
     preds: list[float] = []
     actuals: list[float] = []
@@ -81,11 +90,11 @@ def sarimax_per_series(
     # 5) Suppress ConvergenceWarning after applying mitigations
     warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
-    # 6) Rolling‐window loop: each train set has exactly WINDOW_SIZE observations
+    # 6) Rolling-window loop: each train set has exactly WINDOW_SIZE observations
     for end in range(WINDOW_SIZE, len(subset)):
         start = end - WINDOW_SIZE
         train = subset.iloc[start:end]
-        test = subset.iloc[end : end + 1]
+        test = subset.iloc[end: end + 1]
 
         # 6a) Scale exogenous features based on the training window
         scaler = StandardScaler()
@@ -104,9 +113,9 @@ def sarimax_per_series(
 
         res = model.fit(
             disp=False,
-            maxiter=500,        # increase iterations
-            pgtol=1e-5,         # set gradient tolerance for 'lbfgs'
-            method="lbfgs",     # default optimizer: 'lbfgs'
+            maxiter=500,
+            pgtol=1e-5,
+            method="lbfgs",
         )
 
         # 6c) Forecast the next observation
@@ -116,7 +125,7 @@ def sarimax_per_series(
             exog=test_exog_scaled,
         )
         preds.append(float(forecast.iloc[0]))
-        actuals.append(float(test["y_next"].values[0]))
+        actuals.append(float(test["sales"].values[0]))  # Fixed: use "sales" for RMSE
 
     mse = mean_squared_error(actuals, preds)
     return float(np.sqrt(mse))

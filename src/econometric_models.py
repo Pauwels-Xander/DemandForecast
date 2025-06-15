@@ -14,7 +14,7 @@ WINDOW_SIZE = 52  # number of weeks to train on each iteration
 
 def load_processed() -> pd.DataFrame:
     """Load raw data and apply preprocessing."""
-    from Processing import load_data, preprocess_features
+    from ProcessingOutliersSARIMAX import load_data, preprocess_features
 
     df_raw = load_data(DATA_PATH)
     print(f"After load_data: total rows = {len(df_raw)}")
@@ -32,6 +32,7 @@ def naive_rmse_series(df: pd.DataFrame, store: int, brand: int) -> float:
         df[(df["store"] == store) & (df["brand"] == brand)]
         .sort_values("week")
         .reset_index(drop=True)
+        .copy()
     )
     preds = sub["sales"].shift(1).dropna()
     actuals = sub["sales"].iloc[1:].reset_index(drop=True)
@@ -46,6 +47,7 @@ def ridge_per_series(df: pd.DataFrame, store: int, brand: int) -> tuple[float, f
         df[(df["store"] == store) & (df["brand"] == brand)]
         .sort_values("week")
         .reset_index(drop=True)
+        .copy()
     )
     sub["y_next"] = np.log(sub["sales"].shift(-1))
     sub = sub.dropna().reset_index(drop=True)
@@ -104,6 +106,7 @@ def lasso_per_series(df: pd.DataFrame, store: int, brand: int) -> tuple[float, f
         df[(df["store"] == store) & (df["brand"] == brand)]
         .sort_values("week")
         .reset_index(drop=True)
+        .copy()
     )
     sub["y_next"] = np.log(sub["sales"].shift(-1))
     sub = sub.dropna().reset_index(drop=True)
@@ -132,7 +135,7 @@ def lasso_per_series(df: pd.DataFrame, store: int, brand: int) -> tuple[float, f
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
 
-        model = LassoCV(cv=tscv, random_state=0, max_iter=10000, tol=1e-5).fit(X_train_scaled, y_train)
+        model = LassoCV(cv=tscv, random_state=0, max_iter=10000, tol=1e-3).fit(X_train_scaled, y_train)
         
         selected_feats = [feats[i] for i in range(len(feats)) if model.coef_[i] != 0]
         selected_feats_list.append(selected_feats)
@@ -161,6 +164,7 @@ def gets_per_series(df: pd.DataFrame, store: int, brand: int) -> tuple[float, fl
         df[(df["store"] == store) & (df["brand"] == brand)]
         .sort_values("week")
         .reset_index(drop=True)
+        .copy()
     )
     sub["y_next"] = np.log(sub["sales"].shift(-1))
     sub = sub.dropna().reset_index(drop=True)

@@ -1,6 +1,3 @@
-"""SARIMAX rolling‐window model for OrangeJuiceX25 dataset (window size = 52),
-with fixes for frequency and optimizer warnings, and a progress bar."""
-
 from __future__ import annotations
 
 import warnings
@@ -17,12 +14,7 @@ WINDOW_SIZE = 52  # rolling window length in weeks
 
 
 def load_processed() -> pd.DataFrame:
-    """
-    Load and preprocess the dataset using existing utilities.
-    Assumes "load_data" and "preprocess_features" return a DataFrame
-    with at least columns: ["week", "store", "brand", "sales", "price...", "deal", "feat"].
-    """
-    from Processing import load_data, preprocess_features
+    from ProcessingOutliers import load_data, preprocess_features
 
     df = load_data(DATA_PATH)
     df = preprocess_features(df)
@@ -73,7 +65,7 @@ def sarimax_per_series(
 
     # 4) Define recommended exogenous columns
     recommended_exog_cols = [
-        "OwnLogPrice", "FeatFlag", "DealFlag", "Holiday", "PromoInteraction"
+        "OwnLogPrice", "FeatFlag", "DealFlag", "PromoInteraction"
     ]
     # Only include columns that exist in the dataset
     exog_cols = [c for c in recommended_exog_cols if c in subset.columns]
@@ -174,8 +166,8 @@ if __name__ == "__main__":
     # Load and preprocess all data
     df = load_processed()
 
-    # Example: ARIMA(1,0,0) with no seasonal terms
-    # You can adjust order and seasonal_order as needed.
+    # ARIMA(1,0,0) with no seasonal terms
+    # You can adjust order and seasonal_order as needed. But due to time constraints we only did ARIMA(1,0,0)
     all_rmse_df = evaluate_all_series(
         df,
         order=(1, 0, 0),
